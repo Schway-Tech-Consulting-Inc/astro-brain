@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil import tz
 from skyfield.api import load, wgs84
 from math import atan2, degrees
@@ -57,7 +57,6 @@ def to_utc(dt_local, tz_name):
     local_zone = tz.gettz(tz_name)
     if local_zone is None:
         raise ValueError(f"Unknown timezone: {tz_name}")
-
     return dt_local.replace(tzinfo=local_zone).astimezone(tz.UTC)
 
 def ecliptic_longitude(body, t, observer):
@@ -69,9 +68,15 @@ def ecliptic_longitude(body, t, observer):
     return lon
 
 def compute_asc_mc(t, lat, lon):
-    """Approximate ASC and MC for MVP."""
-    # Local sidereal time (in degrees)
-    lst_deg = t.gast * 15.0
+    """
+    Approximate ASC and MC for MVP.
+
+    For now:
+    - MC ≈ local sidereal time (in degrees)
+    - ASC ≈ MC + 90°
+    This is a simplification; we can refine later.
+    """
+    lst_deg = t.gast * 15.0  # Greenwich apparent sidereal time → degrees
     mc = lst_deg % 360
     asc = (lst_deg + 90) % 360
     return asc, mc
@@ -90,19 +95,32 @@ def chart(req: ChartRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Skyfield time
+    # Skyfield times: now and one hour earlier (for retrograde check)
     t = ts.from_datetime(dt_utc)
+    t_prev = ts.from_datetime(dt_utc - timedelta(hours=1))
 
     # Observer on Earth
     location = wgs84.latlon(req.lat, req.lon)
     observer = eph["earth"] + location
 
-    # Compute planets
+    # Compute planets + retrograde
     planets = {}
     for name, key in PLANET_KEYS.items():
         body = eph[key]
-        lon = ecliptic_longitude(body, t, observer)
-        planets[name] = {"lon": lon}
+
+        # longitude now
+        lon_now = ecliptic_longitude(body, t, observer)
+        # longitude 1 hour earlier
+        lon_prev = ecliptic_longitude(body, t_prev, observer)
+
+        # compute delta in forward direction
+        delta = (lon_now - lon_prev + 540) % 360 - 180  # range -180..+180
+        retro = delta < 0  # going backwards in zodiac
+
+        planets[name] = {
+            "lon": lon_now,
+            "retrograde": retro
+        }
 
     # Compute ASC & MC
     asc, mc = compute_asc_mc(t, req.lat, req.lon)
@@ -113,6 +131,9 @@ def chart(req: ChartRequest):
         "chart": {
             "asc": asc,
             "mc": mc,
-            "planets": planets
+            "planets": planets,
+            # Placeholders we will fill later with proper math or a library:
+            "houses": None,
+            "true_node": None
         }
     }
